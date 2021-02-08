@@ -10,107 +10,61 @@ from tqdm import tqdm
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 
-from models import GCNFacilityLocationLP, linear_program_avg_distance_facility_location_setup
+from models import NNFacilityLocationLP, linear_program_avg_distance_facility_location_setup
 
 
-def correlated_time_demand_data(num_customers=2, num_facilities=2, rho=0, num_samples=1000, rho_noise=1):
-
-	num_nodes = num_customers + num_facilities
-
-	customers = list(range(num_nodes))[:num_customers]
-	facilities = list(range(num_nodes))[num_customers:]
-
-	# Uniform random 2d vector between 0 and 1
-	num_features = 2
-	features = 5*np.random.rand(num_nodes,num_features)
-	mean_travel_times = np.zeros((num_customers, num_facilities))
-	for i in range(num_customers):
-		for j in range(num_facilities):
-			mean_travel_times[i,j] = np.inner(features[i,:], features[j,:])
+def toy_distribution(num_customers=2, num_facilities=2, rho=0, num_samples=1000):
 
 
-	print(mean_travel_times)
-	#exit()
-
-	features = torch.FloatTensor(features)
-
-	mean_demands = np.zeros((num_customers,1))
-	for i in range(num_customers):
-		mean_demands[i] = np.inner(features[i,:], features[i,:])
-
-
-
-	# Sample from a n+1 dimensional gaussian for every node. When 0th index is customer and 1-n+1 is travel_times to facilities. Travel_times are only correlated through effect on demand
-	customer_info = []
-	for customer in range(num_customers):
-
-		mean = np.ones(num_facilities + 1)
-		cov = np.ones((num_facilities+1, num_facilities+1))
-		for index in range(num_facilities):
-			rho_val = rho #* (1 + random.uniform(0,rho_noise))
-			X = np.random.rand(num_facilities+1, num_facilities+1)
-			X = np.matmul(X.T,X)
-			rho_matrix = rho * np.ones((num_facilities+1, num_facilities+1)) 
-			diag_ind = np.diag_indices_from(rho_matrix)
-			rho_matrix[diag_ind[0], diag_ind[1]] = torch.ones(rho_matrix.shape[0])
-			X[diag_ind[0], diag_ind[1]] = torch.ones(rho_matrix.shape[0])
-
-			cov = X * rho_matrix
-
-
-
-			min_eig = np.min(np.real(np.linalg.eigvals(cov)))
-			if min_eig < 0:
-				cov -= min_eig * np.eye(*cov.shape)
-
-			# print(cov)
-			# exit()
-		
-		info = {'mean': mean, 'cov':cov}
-		customer_info.append(info)
-
-
-
-	feed_forward_matrix = np.zeros((num_customers, num_facilities, num_features*2))
-	for i, customer in enumerate(customers):
-		for j, facility in enumerate(facilities):
-			customer_features = features[customer]
-			facility_features = features[facility]
-			concat_features = np.concatenate([customer_features, facility_features])
-			feed_forward_matrix[i,j,:] = concat_features
-
-	feed_forward_matrix = torch.FloatTensor(feed_forward_matrix)
-
+	std_dev = np.sqrt(20.25)
+	sig_d = std_dev
+	sig_t = std_dev
+	sig_bad = 3.
 
 	demands_all = []
 	travel_times_all = []
-	ground_truth_distances_all = []
 	customer_facility_distances_all = []
-	for i in range(num_samples):
-
-		demands = np.zeros_like(mean_demands)
-		travel_times = np.zeros_like(mean_travel_times)
-
-		for customer_index in range(num_customers):
-			# Sample demand error and travel_time error for every connected facility
-			error_sample = np.random.multivariate_normal(customer_info[customer_index]['mean'], customer_info[customer_index]['cov'],size=1)[0]
-			# print(customer_info[customer_index]['cov'])
-			# print(error_sample)
-			# exit()
-			demands[customer] = mean_demands[customer_index] + error_sample[0]
-			travel_times[customer_index, :] = mean_travel_times[customer_index, :] + error_sample[1:]
-
-		# demands = np.maximum(demands, 0.01)
-		# travel_times = np.maximum(travel_times,0.01)
+	features_all = []
+	conditional_features = []
+	base_features = []
+	demand_features = []
 
 
-		demands_all.append(demands)
-		travel_times_all.append(travel_times)
+	half = int(num_facilities/2)
+
+	feed_forward_matrix = np.ones((num_customers, num_facilities,2))
+	feed_forward_matrix = torch.FloatTensor(feed_forward_matrix)
+
+	zs = []
+
+	for sample in range(num_samples):
+		travel_times = np.zeros((num_customers, num_facilities))
+
+		z = rho * np.random.randn(num_facilities) * std_dev # latent variable
+		zs.append(z)
+		features = np.ones((num_customers, num_facilities)) * z
+		demand_features.append(torch.FloatTensor(np.ones((num_customers)) * z))
+		base_features.append(torch.FloatTensor(features))
+		conditional_features.append(torch.FloatTensor(features*z))
+
+		demands = 5.5 + np.sign(rho)*z + np.sqrt(1-rho**2) * sig_d * np.random.randn(num_facilities)#np.maximum(v[:,1],0)
+		demands = np.maximum(demands,0)
+		times2 = np.maximum(6 + np.random.randn(half) * sig_bad,0)
+
+		for customer in range(num_customers):
+			correlated_customer_travel_time = np.maximum(5.5 + z[customer] + np.sqrt(1-rho**2) * sig_t * np.random.randn(1),0)#times1[customer]
+			travel_times[customer,half:] = np.ones(half)*correlated_customer_travel_time
+			travel_times[customer,:half] = times2
+
 
 		customer_facility_distances = (travel_times.T * demands).T
 		customer_facility_distances_all.append(customer_facility_distances)
 
-	return demands_all, travel_times_all, feed_forward_matrix, customer_facility_distances_all
+		demands_all.append(demands)
+		travel_times_all.append(travel_times)
+		
+
+	return demands_all, travel_times_all, feed_forward_matrix, customer_facility_distances_all, conditional_features, base_features, demand_features, zs
 
 
 
@@ -137,12 +91,8 @@ def train(no_cuda=True,
 	if cuda:
 	    torch.cuda.manual_seed(seed)
 
-	demands, travel_times, feed_forward_matrix, customer_facility_distances = correlated_time_demand_data(num_customers=num_nodes,num_facilities=num_nodes,rho=rho, num_samples=num_samples, rho_noise=rho_noise)
+	demands, travel_times, feed_forward_matrix, customer_facility_distances, conditional_features, base_features, demand_features,z = toy_distribution(num_customers=num_nodes,num_facilities=num_nodes,rho=rho, num_samples=num_samples)
 
-	# print('Demands:%s' % demands[0])
-	# print('Travel_times:%s' % travel_times[0])
-	# print('Ground_truth_distances:%s' % ground_truth_distances[0])
-	# exit() 
 
 	num_customers = feed_forward_matrix.shape[0]
 	num_facilities = feed_forward_matrix.shape[1]
@@ -154,15 +104,17 @@ def train(no_cuda=True,
 
 	nfeat = feed_forward_matrix.shape[2]
 
-	model = GCNFacilityLocationLP(nfeat=nfeat,
+	model = NNFacilityLocationLP(num_nodes,
+					nfeat=nfeat,
 	                nhid=hidden,
 	                nout=embed_dim,
 	                dropout=dropout,
 	                K = K, 
 	                nlayers = 2)
 
-	optimizer = optim.Adam(model.parameters(), lr = lr, 
-	                                   weight_decay = weight_decay)
+	optimizer = optim.Adam(model.parameters(), lr = lr, weight_decay = weight_decay)
+
+	# optim.SGD(model.parameters(), lr = lr, weight_decay = 0.)#
 
 
 	# Get two-stage distance expected values
@@ -180,13 +132,6 @@ def train(no_cuda=True,
 
 	two_stage_expected_distances = (two_stage_travel_times.T * two_stage_demands).T
 
-	print('Two stage distances')
-	print(two_stage_expected_distances)
-	print('OPT distances')
-	print(opt_dist)
-
-	#exit()
-
 	# Get two-stage assignment
 	problem, parameters, variables = linear_program_avg_distance_facility_location_setup(num_customers, num_facilities,mip=True)
 	parameters[0].value = two_stage_expected_distances
@@ -194,16 +139,14 @@ def train(no_cuda=True,
 	solution = problem.solve(solver= cp.GLPK_MI, verbose=False) # GLPK_MI
 	twostage_assignments = variables[1].value
 
-	# Get OPT
+
+	# Get OPT assignment
 	problem, parameters, variables = linear_program_avg_distance_facility_location_setup(num_customers, num_facilities,mip=True)
 	parameters[0].value = opt_dist
 	parameters[1].value = K
 	solution = problem.solve(solver= cp.GLPK_MI, verbose=False) # GLPK_MI
 	opt_assignments = variables[1].value
 
-
-	# print(customer_facility_distances[0])
-	# exit()
 
 	losses = []
 	losses_test = []
@@ -216,7 +159,7 @@ def train(no_cuda=True,
 		
 		i = np.random.choice(train_instances)
 		#ground_truth_distances_i = #ground_truth_distances[i]
-		facilities, assignments, predicted_dists = model(feed_forward_matrix) #model(features, adj)
+		facilities, assignments, predicted_dists = model(base_features[i])#model(feed_forward_matrix) #model(features, adj)
 		#print(predicted_dists)
 		ground_truth_demand_weighted_distance = torch.FloatTensor(customer_facility_distances[i])
 		loss = torch.sum(ground_truth_demand_weighted_distance * assignments)
@@ -228,7 +171,7 @@ def train(no_cuda=True,
 		two_stage_losses.append(two_stage_loss.item())
 
 		opt_loss = torch.sum(ground_truth_demand_weighted_distance * opt_assignments)
-		opt_losses.append(two_stage_loss.item())
+		opt_losses.append(opt_loss.item())
 
 
 		if t % 10 == 0:
@@ -236,41 +179,23 @@ def train(no_cuda=True,
 			optimizer.zero_grad()
 
 			print('End2End:%f,2Stage:%f,OPT:%f' % (np.mean(batch_losses),np.mean(two_stage_losses),np.mean(opt_losses)))
-			#print(np.mean(batch_losses))
 			batch_losses = []
 			two_stage_losses = []
 			opt_losses = []
 
-		# print('predicted_dists...')
-		# print(predicted_dists.detach())
-		# print('true dists')
-		# print(ground_truth_demand_weighted_distance.detach())
-		# print('assignments...')
-		# print(assignments.detach())
-		# print(facilities.detach())
 
-
-
-	#print('Training losses: %s' % (losses))
-
-	#exit()
 
 	# Get end-to-end assignment
 	end2end_facilities, end2end_assignments, predicted_dists = model(feed_forward_matrix, mip=True)
-	# print('End-to-end assignments')
-	# print(predicted_dists)
-	# print(end2end_facilities)
-	# print(end2end_assignments)
-
-
-	# print('two-stage assignments')
-	# print(assignments)
-
 
 
 	# Turn of model learning
 	model.eval()
 	torch.no_grad()
+	opt_losses = []
+	losses_test_two_stage = []
+	losses_test_two_stage_conditional = []
+	losses_test = []
 	for i in tqdm(test_instances, desc='Testing'):
 		
 		ground_truth_demand_weighted_distance = torch.FloatTensor(customer_facility_distances[i])
@@ -286,15 +211,15 @@ def train(no_cuda=True,
 		loss = torch.sum(ground_truth_demand_weighted_distance * twostage_assignments)
 		losses_test_two_stage.append(loss.item())
 
-		#exit()
+		# Optimal
+		opt_loss = torch.sum(ground_truth_demand_weighted_distance * opt_assignments)
+		opt_losses.append(opt_loss.item())
 
 
+	print('Test:')
+	print('End2End:%f,2Stage:%f,OPT:%f' % (np.mean(losses_test),np.mean(losses_test_two_stage),np.mean(opt_losses)))
 
-	print('End-to-end loss: %f. Complete losses: %s' % (np.mean(losses_test), losses_test))
-	print('Two-stage loss: %f. Complete losses: %s' % (np.mean(losses_test_two_stage), losses_test_two_stage))
-
-	return losses_test, losses_test_two_stage
-# Plot rho vs two_stage-end2end gap
+	return losses_test, losses_test_two_stage, opt_losses
 
 
 if __name__ == "__main__":

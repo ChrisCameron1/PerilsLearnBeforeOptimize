@@ -140,16 +140,14 @@ def linear_program_avg_distance_facility_location_setup(num_customers=None, num_
                     assignments_upper_bound,
                     facility_cap]
 
-    penalty_term_weight = 0.01
+    penalty_term_weight = 10.0
     # squared 2-norm of decision variables
-    weighted_assignments = assignments * penalty_term_weight
     quadratic_penalty_term = cp.norm(assignments) * penalty_term_weight
 
-    #cp.sum(cp.sum(cp.atoms.affine.binary_operators.multiply(weighted_assignments, assignments), axis=1),axis=0)
     if mip:
         objective = cp.Minimize(loss)
     else:
-        objective = cp.Minimize(loss + quadratic_penalty_term) # TODO: Add quadratic penalty term?? First check that it is differentiable as is.
+        objective = cp.Minimize(loss + quadratic_penalty_term)
     problem = cp.Problem(objective, constraints)
 
     return problem, [dists, K], [facilities, assignments]
@@ -157,8 +155,8 @@ def linear_program_avg_distance_facility_location_setup(num_customers=None, num_
 class GCNLP(nn.Module):
     '''
     The GCNLP architecture. The first step is a GCN to generate embeddings.
-    The output is the cluster means mu and soft assignments r, along with the 
-    embeddings and the the node similarities (just output for debugging purposes).
+    The dot product of those embeddings give demand-weighted travel times predictions
+    The output is the solution to LP given those parameers inputs
     
     The forward pass inputs are x, a feature matrix for the nodes, and adj, a sparse
     adjacency matrix.
@@ -177,46 +175,41 @@ class GCNLP(nn.Module):
         embeds = self.GCN(x, adj) # x are node features, adj are indices
         dists = torch.matmul(embeds, embeds.t())
 
-        #print('Predicted distances: %s' % dists)
-        # Set diagonal (self edges to 0)
         ind = np.diag_indices(dists.shape[0])
         dists[ind[0], ind[1]] = torch.zeros(dists.shape[0])
 
         num_nodes = x.shape[0]
         problem, parameters, variables = linear_program_kcenter_setup(num_nodes,mip=False)
-        #TODO: Run a few iterations of cutting planes solvers and add additional cutting plane contraints to problem before solving...
         lp_layer = CvxpyLayer(problem, parameters=parameters, variables=variables)
         dists = dists.unsqueeze(0).type(torch.float32)
-        # try, catch in case unsolved?
-        facilities, assignments, distance_slacks, global_slack = lp_layer(dists, self.K) # mu=facilities, r=assignment
+        facilities, assignments, distance_slacks, global_slack = lp_layer(dists, self.K)
 
         return facilities, assignments, embeds, distance_slacks
 
 
-class GCNFacilityLocationLP(nn.Module):
+class NNFacilityLocationLP(nn.Module):
     '''
-    The GCNLP architecture. The first step is a GCN to generate embeddings.
-    The output is the cluster means mu and soft assignments r, along with the 
-    embeddings and the the node similarities (just output for debugging purposes).
-    
-    The forward pass inputs are x, a feature matrix for the nodes, and adj, a sparse
-    adjacency matrix.
+    The neural network facility location linear programming architecture. The first step is a NN to generate embeddings.
+    The dot product of those embeddings give demand-weighted travel times predictions.
+    The output is the solution to facility location LP given those parameter inputs.
+    At test time, can set mip=True to do a forward pass optimally with integer constraints
     '''
-    def __init__(self, nfeat, nhid, nout, dropout, K, nlayers):
-        super(GCNFacilityLocationLP, self).__init__()
+    def __init__(self, num_nodes, nfeat, nhid, nout, dropout, K, nlayers):
+        super(NNFacilityLocationLP, self).__init__()
+
 
         self.K = torch.tensor(K).type(torch.float32).unsqueeze(0)
-        self.ff1 = nn.Linear(nfeat,nhid)
-        self.relu1 = torch.nn.ReLU()
-        self.ff2 = nn.Linear(nhid,1)
+        # self.ff1 = nn.Linear(nfeat,1)
+        # torch.nn.init.xavier_normal(self.ff1.weight)
+        # self.relu1 = torch.nn.ReLU()
+        # self.ff2 = nn.Linear(nhid,1)
+        # torch.nn.init.xavier_normal(self.ff2.weight)
 
-
+        self.pars = torch.nn.Parameter(torch.randn(num_nodes,num_nodes) * 1e-2, requires_grad=True)
         
-    def forward(self, x, mip=False):#adj,mip=False):
+    def forward(self, x, mip=False):
 
-        out = self.ff1(x)
-        out = self.relu1(out)
-        dists = self.ff2(out).squeeze()
+        dists = self.pars
 
         num_customers = x.shape[0]
         num_facilities = x.shape[1]
@@ -229,12 +222,10 @@ class GCNFacilityLocationLP(nn.Module):
             solution = problem.solve(solver= cp.GLPK_MI, verbose=False)
             facilities = variables[0].value
             assignments = variables[1].value
-
         else:
             lp_layer = CvxpyLayer(problem, parameters=parameters, variables=variables)
             dists = dists.unsqueeze(0).type(torch.float32)
-            # try, catch in case unsolved?
-            facilities, assignments = lp_layer(dists, self.K) # mu=facilities, r=assignment
+            facilities, assignments = lp_layer(dists, self.K)
 
         return facilities, assignments, dists
     
@@ -290,25 +281,3 @@ class GCNDeepSigmoid(nn.Module):
         x = self.gcend(x, adj)
         x = torch.nn.Sigmoid()(x).flatten()
         return x
-
-
-    
-class GCNLink(nn.Module):
-    '''
-    GCN link prediction model based on:
-    
-    M. Schlichtkrull, T. Kipf, P. Bloem, R. Van Den Berg, I. Titov, and M. Welling. Modeling
-    416 relational data with graph convolutional networks. In European Semantic Web Conference,
-    417 2018.
-    '''
-    def __init__(self, nfeat, nhid, nout, dropout):
-        super(GCNLink, self).__init__()
-
-        self.GCN = GCN(nfeat, nhid, nout, dropout)
-        self.distmult = nn.Parameter(torch.rand(nout))
-        self.sigmoid = nn.Sigmoid()
-    
-    def forward(self, x, adj, to_pred):
-        embeds = self.GCN(x, adj)
-        dot = (embeds[to_pred[:, 0]]*self.distmult.expand(to_pred.shape[0], self.distmult.shape[0])*embeds[to_pred[:, 1]]).sum(dim=1)
-        return dot
