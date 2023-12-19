@@ -1,4 +1,4 @@
-Official code for exeperiments of The Perils of Learning Before Optimizing, AAAI 2022, https://arxiv.org/pdf/2106.10349.pdf
+Official code for experiments of paper: The Perils of Learning Before Optimizing, AAAI 2022, https://arxiv.org/pdf/2106.10349.pdf
 
 - To reproduce our experiments, run "python experiments.py"
 - Find the training and data generating code in train.py"
